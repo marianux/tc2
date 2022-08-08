@@ -7,19 +7,22 @@ Created on Wed Mar 18 16:30:31 2020
 """
 
 
-from splane import pzmap, grpDelay, bodePlot
+from splane import pzmap, GroupDelay, bodePlot
 from scipy.signal import TransferFunction
 import matplotlib.pyplot as plt
+import numpy as np
 
 
-w0 = 10**3
-qq = 1
-
+w0 = 1
+qq = np.sqrt(2)/2
 
 my_tf = TransferFunction( [w0**2], [1, w0/qq, w0**2] )
 
-bodePlot(my_tf)
 
-pzmap(my_tf) #S plane pole/zero plot
+plt.close('all')
 
-grpDelay(my_tf)
+bodePlot(my_tf, fig_id=1, filter_description = 'Q={:3.3f}'.format(qq) )
+
+pzmap(my_tf, fig_id=2, filter_description = 'Q={:3.3f}'.format(qq)) #S plane pole/zero plot
+
+GroupDelay(my_tf, fig_id=3, filter_description = 'Q={:3.3f}'.format(qq))
