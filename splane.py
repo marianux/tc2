@@ -35,11 +35,865 @@ from collections import defaultdict
 from scipy.signal import tf2zpk, TransferFunction, zpk2tf
 from IPython.display import display, Math, Markdown
 import sympy as sp
-from sympy.abc import s
+# Laplace complex variable. s = σ + j.ω
+from sympy.polys.partfrac import apart
+
 from schemdraw import Drawing
-from schemdraw.elements import  Resistor, ResistorIEC, Capacitor, Inductor, Line, Dot, Gap, Arrow, CurrentLabelInline
+from schemdraw.elements import  Resistor, ResistorIEC, Capacitor, Inductor, Line, Dot, Gap, Arrow
 
 from fractions import Fraction
+
+from os import path
+import shutil
+
+import time
+
+##########################################
+#%% Variables para el análisis simbólico #
+##########################################
+
+# Laplace complex variable. s = σ + j.ω
+s = sp.symbols('s', complex=True)
+# Fourier real variable ω 
+w = sp.symbols('w', complex=False)
+
+
+############################################
+#%% Variables para la interfaz con LTspice #
+############################################
+
+# unidades para dibujar en la hoja de LTspice
+ltux = 16 
+ltuy = 16
+
+# Archivo marco contenedor de las redes sintetizadas como 
+# ecualizadores/filtros
+filename_eq_base = 'ltspice_equalizador_base'
+
+# enumeradores de los elementos pasivos
+cap_num = 1
+res_num = 1
+ind_num = 1
+node_num = 1
+
+
+# cursor para la localización de componentes
+cur_x = 0
+cur_y = 0
+
+# tamaño estandard del cable
+lt_wire_length = 4 # ltux/ltuy unidades normalizadas
+
+#####
+# Palabras clave del LTspice para disponer los componentes en el
+# esquemático.
+
+# elementos pasivos en derivacion
+
+res_der_str = [ 'SYMBOL res {:d} {:d} R0\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 48 43 Left 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 47 68 Left 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]
+
+ind_der_str = [ 'SYMBOL ind {:d} {:d} R0\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 47 34 Left 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 43 65 Left 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]
+
+cap_der_str = [ 'SYMBOL cap {:d} {:d} R0\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 48 18 Left 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 45 49 Left 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]
+
+# elementos pasivos en serie
+
+res_ser_str = [ 'SYMBOL res {:d} {:d} R90\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 -7 86 VBottom 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 -36 24 VTop 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]
+
+ind_ser_str = [ 'SYMBOL ind {:d} {:d} R270\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 40 19 VTop 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 67 100 VBottom 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]
+
+cap_ser_str = [ 'SYMBOL cap {:d} {:d} R90\n', # posición absoluta X-Y en el esquemático
+                'WINDOW 0 -8 55 VBottom 2\n', # posiciones relativas de etiquetas
+                'WINDOW 3 -37 0 VTop 2\n', # posiciones relativas de etiquetas
+                'SYMATTR InstName {:s}\n', # etiqueta que tendrá
+                'SYMATTR Value {:3.5f}\n' # valor que tendrá
+               ]  
+
+
+############################################
+#%% Funciones para ... #
+############################################
+
+def dibujar_Tee(ZZ):
+    '''
+    Dibuja una red Tee a partir de la matriz Z.
+
+    Parameters
+    ----------
+    Ymai : Symbolic Matrix
+        Matriz admitancia indefinida.
+    nodes2del : list or integer
+        Nodos que se van a eliminar.
+
+    Returns
+    -------
+    YY : Symbolic Matrix
+        Matriz admitancia 
+
+    '''
+    
+    # Dibujo la red Tee
+    
+    d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+    
+    d = dibujar_puerto_entrada(d,
+                                   port_name = 'In' )
+    
+    Za = ZZ[0,0] - ZZ[0,1] 
+    Zb = ZZ[0,1] 
+    Zc = ZZ[1,1] - ZZ[0,1] 
+    
+    d = dibujar_elemento_serie(d, ResistorIEC, Za )
+    d = dibujar_elemento_derivacion(d, ResistorIEC, Zb )
+    d = dibujar_elemento_serie(d, ResistorIEC, Zc )
+    
+    d = dibujar_puerto_salida(d, 
+                                  port_name = 'Out')
+
+    display(d)        
+    
+    return([Za,Zb,Zc])
+
+
+def dibujar_Pi(YY):
+    '''
+    Dibuja una red Pi a partir de la matriz Y.
+
+    Parameters
+    ----------
+    Ymai : Symbolic Matrix
+        Matriz admitancia indefinida.
+    nodes2del : list or integer
+        Nodos que se van a eliminar.
+
+    Returns
+    -------
+    YY : Symbolic Matrix
+        Matriz admitancia 
+
+    '''
+    
+    # Dibujo la red Tee
+    
+    d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+    
+    d = dibujar_puerto_entrada(d,
+                                   port_name = 'In')
+    
+    Ya = YY[0,0] + YY[0,1]
+    Yb = -YY[0,1]
+    Yc = YY[1,1] + YY[0,1]
+    
+    if isinstance(YY[0,0], sp.Symbol):
+        
+        Za = sp.simplify(sp.expand(1/Ya))
+        Zb = sp.simplify(sp.expand(1/Yb))
+        Zc = sp.simplify(sp.expand(1/Yc))
+        
+    else:
+
+        Za = 1/(YY[0,0] + YY[0,1])
+        Zb = 1/(-YY[0,1])
+        Zc = 1/(YY[1,1] + YY[0,1])
+    
+    d = dibujar_elemento_derivacion(d, ResistorIEC, Za )
+    d = dibujar_elemento_serie(d, ResistorIEC, Zb )
+    d = dibujar_elemento_derivacion(d, ResistorIEC, Zc )
+    
+    d = dibujar_puerto_salida(d, 
+                                  port_name = 'Out')
+    
+    display(d)        
+    
+    return([Ya, Yb, Yc])
+
+
+
+def dibujar_cauer_RC_RL(ki = None, y_exc = None, z_exc = None):
+    '''
+    Description
+    -----------
+    Draws a parallel non-disipative admitance following Foster synthesis method.
+
+        YorZ = ki / s +  1 / ( ki_i / s + koo_i * s ) 
+    
+    Parameters
+    ----------
+    ki : symbolic positive real number. The residue value at DC or s->0.
+        
+    koo : symbolic positive real number. The residue value at inf or s->oo.
+        
+    ki : symbolic positive real array of numbers. A list of residue pairs at 
+         each i-th finite pole or s**2->-(w_i**2). The first element of the pair
+         is the ki_i value (capacitor), while the other is the koo_i (inductor)
+         value.
+
+    Returns
+    -------
+    The drawing object.
+    
+    Ejemplo
+    -------
+
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Foster
+    ki, koo, ki = tc2.foster(Imm)
+    
+    # Tratamos a nuestra función imitancia como una Z
+    tc2.dibujar_foster_derivacion(ki, koo, ki, y_exc = Imm)
+
+    '''    
+    if y_exc is None and z_exc is None:
+
+        assert('Hay que definir si se trata de una impedancia o admitancia')
+
+    if not(ki is None) or len(ki) > 0:
+        # si hay algo para dibujar ...
+        
+        d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+
+        d = dibujar_puerto_entrada(d,
+                                       voltage_lbl = ('+', '$V$', '-'), 
+                                       current_lbl = '$I$')
+
+        if y_exc is None:
+            
+            bIsImpedance = True
+            
+            d, _ = dibujar_funcion_exc_abajo(d, 
+                                                      'Z',  
+                                                      z_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+        else:
+            bIsImpedance = False
+            
+            d, _ = dibujar_funcion_exc_abajo(d, 
+                                                      'Y',  
+                                                      y_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+    
+        if bIsImpedance:
+            bSeries = True
+        else:
+            bSeries = False
+        
+        bComponenteDibujadoDerivacion = False
+
+        for kii in ki:
+
+
+            if bSeries:
+                
+                if sp.degree(kii*s) == 1:
+                    d = dibujar_elemento_serie(d, Resistor, kii)
+                elif sp.degree(kii*s) == 0:
+                    d = dibujar_elemento_serie(d, Capacitor, 1/(s*kii))
+                else:
+                    d = dibujar_elemento_serie(d, Inductor, kii/s)
+                    
+                bComponenteDibujadoDerivacion = False
+
+            else:
+
+                if bComponenteDibujadoDerivacion:
+                    
+                    dibujar_espacio_derivacion(d)
+
+                if sp.degree(kii*s) == 1:
+                    d = dibujar_elemento_derivacion(d, Resistor, 1/kii)
+                elif sp.degree(kii*s) == 2:
+                    d = dibujar_elemento_derivacion(d, Capacitor, kii/s)
+                else:
+                    d = dibujar_elemento_derivacion(d, Inductor, 1/(s*kii))
+                
+                bComponenteDibujadoDerivacion = True
+
+            bSeries = not bSeries
+
+        if not bComponenteDibujadoDerivacion:
+            
+            d += Line().right().length(d.unit*.25)
+            d += Line().down()
+            d += Line().left().length(d.unit*.25)
+        
+        display(d)
+
+    else:    
+        
+        print('Nada para dibujar')
+
+
+def dibujar_cauer_LC(ki = None, y_exc = None, z_exc = None):
+    '''
+    Description
+    -----------
+    Draws a parallel non-disipative admitance following Foster synthesis method.
+
+        YorZ = ki / s +  1 / ( ki_i / s + koo_i * s ) 
+    
+    Parameters
+    ----------
+    ki : symbolic positive real number. The residue value at DC or s->0.
+        
+    koo : symbolic positive real number. The residue value at inf or s->oo.
+        
+    ki : symbolic positive real array of numbers. A list of residue pairs at 
+         each i-th finite pole or s**2->-(w_i**2). The first element of the pair
+         is the ki_i value (capacitor), while the other is the koo_i (inductor)
+         value.
+
+    Returns
+    -------
+    The drawing object.
+    
+    Ejemplo
+    -------
+
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Foster
+    ki, koo, ki = tc2.foster(Imm)
+    
+    # Tratamos a nuestra función imitancia como una Z
+    tc2.dibujar_foster_derivacion(ki, koo, ki, y_exc = Imm)
+
+    '''    
+    if y_exc is None and z_exc is None:
+
+        assert('Hay que definir si se trata de una impedancia o admitancia')
+
+    if not(ki is None) or len(ki) > 0:
+        # si hay algo para dibujar ...
+        
+        d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+
+        d = dibujar_puerto_entrada(d,
+                                       voltage_lbl = ('+', '$V$', '-'), 
+                                       current_lbl = '$I$')
+
+        if y_exc is None:
+            
+            bIsImpedance = True
+            
+            d, _ = dibujar_funcion_exc_abajo(d, 
+                                                      'Z',  
+                                                      z_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+        else:
+            bIsImpedance = False
+            
+            d, _ = dibujar_funcion_exc_abajo(d, 
+                                                      'Y',  
+                                                      y_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+    
+        if bIsImpedance:
+            bSeries = True
+        else:
+            bSeries = False
+
+        # 1/s me da orden 1, atenti.
+        if sp.degree(ki[0]*s) == 2 :
+            bCauer1 = True
+        else:
+            bCauer1 = False
+        
+        
+        bComponenteDibujadoDerivacion = False
+
+        for kii in ki:
+
+
+            if bSeries:
+                
+                if bCauer1:
+                    d = dibujar_elemento_serie(d, Inductor, kii/s)
+                else:
+                    d = dibujar_elemento_serie(d, Capacitor, 1/(s*kii))
+                    
+                bComponenteDibujadoDerivacion = False
+
+            else:
+
+                if bComponenteDibujadoDerivacion:
+                    
+                    dibujar_espacio_derivacion(d)
+
+                if bCauer1:
+                    d = dibujar_elemento_derivacion(d, Capacitor, kii/s)
+                else:
+                    d = dibujar_elemento_derivacion(d, Inductor, 1/(s*kii))
+                
+                bComponenteDibujadoDerivacion = True
+
+            bSeries = not bSeries
+
+        if not bComponenteDibujadoDerivacion:
+            
+            d += Line().right().length(d.unit*.25)
+            d += Line().down()
+            d += Line().left().length(d.unit*.25)
+        
+        display(d)
+
+    else:    
+        
+        print('Nada para dibujar')
+
+
+
+def cauer_RC( imm, remover_en_inf=True ):
+    '''
+    Description
+    -----------
+    Perform continued fraction expansion over imm following Cauer 2 synthesis method.
+
+        imm = k0_0 / s + 1 / ( k0_1 + 1/ (k0_2 / s  + 1/ ... )) 
+
+    Parameters
+    ----------
+    immittance : symbolic rational function
+        La inmitancia a sintetizar.
+
+    Returns
+    -------
+    A list k0 with the i-th k0_i resulted from continued fraction expansion.
+
+    Ejemplo
+    -------
+    
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Cauer 1 o remociones continuas en infinito
+    imm_cauer_0, k0 = tc2.cauer_0(Imm)
+
+    '''    
+    
+    ko = []
+
+    if remover_en_inf:
+        rem, koi = remover_polo_infinito(imm)
+        bRemoverPolo = False
+
+        if koi.is_zero:
+            rem, koi = remover_valor_en_infinito(imm)
+            bRemoverPolo = True
+            
+    else:
+        
+        rem, koi = remover_polo_dc(imm)
+        bRemoverPolo = False
+
+        if koi.is_zero:
+            rem, koi = remover_valor_en_dc(imm)
+            bRemoverPolo = True
+
+    
+        
+    while not(rem.is_zero) and not(koi.is_zero):
+        
+        ko += [koi]
+        rem = 1/rem
+
+        if remover_en_inf:
+            
+            if bRemoverPolo:
+                rem, koi = remover_polo_infinito(rem)
+                bRemoverPolo = False
+            else:
+                rem, koi = remover_valor_en_infinito(rem)
+                bRemoverPolo = True
+        else:
+            
+            if bRemoverPolo:
+                rem, koi = remover_polo_dc(rem)
+                bRemoverPolo = False
+            else:
+                rem, koi = remover_valor_en_dc(rem)
+                bRemoverPolo = True
+
+
+    if koi.is_zero:
+        # deshago para entender al resto de la misma 
+        # naturaleza que el último elemento que retiró.
+        rem = 1/rem
+    else:
+        ko += [koi]
+
+    imm_as_cauer = koi
+    
+    for ii in np.flipud(np.arange(len(ko)-1)):
+
+        imm_as_cauer = ko[ii] + 1/imm_as_cauer
+        
+    return(ko, imm_as_cauer, rem)
+
+def cauer_LC( imm, remover_en_inf = True ):
+    '''
+    Description
+    -----------
+    Perform continued fraction expansion over imm following Cauer 1 synthesis method.
+
+        imm = koo_0 * s + 1 / ( koo_1 * s + 1/ (koo_2 * s  + 1/ ... )) 
+
+    Parameters
+    ----------
+    immittance : symbolic rational function
+        La inmitancia a sintetizar.
+
+    Returns
+    -------
+    A list koo with the i-th koo_i resulted from continued fraction expansion.
+
+    Ejemplo
+    -------
+    
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Cauer 1 o remociones continuas en infinito
+    imm_cauer_oo, koo = tc2.cauer_oo(Imm)
+
+    '''    
+        
+    rem = imm
+    ko = []
+
+    # a veces por problemas numéricos no hay cancelaciones de los términos 
+    # de mayor o menor orden y quedan coeficientes muy bajos.
+    rem = trim_func_s(sp.simplify(sp.expand(rem)))
+
+    if remover_en_inf:
+        rem, koi = remover_polo_infinito(rem)
+    else:
+        rem, koi = remover_polo_dc(rem)
+        
+    
+    while not(rem.is_zero) and not(koi.is_zero):
+        
+        ko += [koi]
+        rem = 1/rem
+
+        # a veces por problemas numéricos no hay cancelaciones de los términos 
+        # de mayor o menor orden y quedan coeficientes muy bajos.
+        rem = trim_func_s(sp.simplify(sp.expand(rem)))
+
+        if remover_en_inf:
+            rem, koi = remover_polo_infinito(rem)
+        else:
+            rem, koi = remover_polo_dc(rem)
+
+    if koi.is_zero:
+        # deshago para entender al resto de la misma 
+        # naturaleza que el último elemento que retiró.
+        rem = 1/rem
+    else:
+        ko += [koi]
+
+    imm_as_cauer = ko[-1] + rem
+
+    for ii in np.flipud(np.arange(len(ko)-1)):
+        
+        imm_as_cauer = ko[ii] + 1/imm_as_cauer
+        
+    return(ko, imm_as_cauer, rem)
+
+
+
+def dibujar_foster_derivacion(k0 = None, koo = None, ki = None, y_exc = None):
+    '''
+    Description
+    -----------
+    Draws a parallel non-disipative admitance following Foster synthesis method.
+
+        Y = k0 / s + koo * s +  1 / ( k0_i / s + koo_i * s ) 
+    
+    Parameters
+    ----------
+    k0 : symbolic positive real number. The residue value at DC or s->0.
+        
+    koo : symbolic positive real number. The residue value at inf or s->oo.
+        
+    ki : symbolic positive real array of numbers. A list of residue pairs at 
+         each i-th finite pole or s**2->-(w_i**2). The first element of the pair
+         is the k0_i value (capacitor), while the other is the koo_i (inductor)
+         value.
+
+    Returns
+    -------
+    The drawing object.
+    
+    Ejemplo
+    -------
+
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Foster
+    k0, koo, ki = tc2.foster(Imm)
+    
+    # Tratamos a nuestra función imitancia como una Z
+    tc2.dibujar_foster_derivacion(k0, koo, ki, y_exc = Imm)
+
+    '''    
+
+    if not(k0 is None and koo is None and ki is None):
+        # si hay algo para dibujar ...
+        
+        d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+
+        bComponenteDibujado = False
+
+        d = dibujar_puerto_entrada(d,
+                                       voltage_lbl = ('+', '$V$', '-'), 
+                                       current_lbl = '$I$')
+
+        if not(y_exc is None):
+            d, _ = dibujar_funcion_exc_abajo(d, 
+                                                      'Y',  
+                                                      y_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+
+        if not(k0 is None):
+        
+            d = dibujar_elemento_derivacion(d, Inductor, 1/k0)
+            
+            bComponenteDibujado = True
+            
+            
+        if not(koo is None):
+        
+            if bComponenteDibujado:
+                
+                dibujar_espacio_derivacion(d)
+                    
+            d = dibujar_elemento_derivacion(d, Capacitor, koo)
+
+            bComponenteDibujado = True
+            
+        if not(ki is None):
+
+            for un_tanque in ki:
+
+                if bComponenteDibujado:
+                    
+                    dibujar_espacio_derivacion(d)
+                
+                d = dibujar_tanque_derivacion(d, inductor_lbl = un_tanque[1], capacitor_lbl = 1/un_tanque[0])
+
+                bComponenteDibujado = True
+
+        
+        display(d)
+
+    else:    
+        
+        print('Nada para dibujar')
+
+
+def dibujar_foster_serie(k0 = None, koo = None, ki = None, z_exc = None):
+    '''
+    Description
+    -----------
+    Draws a series non-disipative impedance following Foster synthesis method.
+
+        Z = k0 / s + koo * s +  1 / ( k0_i / s + koo_i * s ) 
+    
+    Parameters
+    ----------
+    k0 : symbolic positive real number. The residue value at DC or s->0.
+        
+    koo : symbolic positive real number. The residue value at inf or s->oo.
+        
+    ki : symbolic positive real array of numbers. A list of residue pairs at 
+         each i-th finite pole or s**2->-(w_i**2). The first element of the pair
+         is the k0_i value (inductor), while the other is the koo_i (capacitor)
+         value.
+
+    Returns
+    -------
+    The drawing object.
+    
+    Ejemplo
+    -------
+
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Foster
+    k0, koo, ki = tc2.foster(Imm)
+    
+    # Tratamos a nuestra función imitancia como una Z
+    tc2.dibujar_foster_serie(k0, koo, ki, z_exc = Imm)
+
+    '''    
+
+    if not(k0 is None and koo is None and ki is None):
+        # si hay algo para dibujar ...
+        
+        d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
+
+        d = dibujar_puerto_entrada(d,
+                                       voltage_lbl = ('+', '$V$', '-'), 
+                                       current_lbl = '$I$')
+
+        if not(z_exc is None):
+            d, z5_lbl = dibujar_funcion_exc_abajo(d, 
+                                                      'Z',  
+                                                      z_exc, 
+                                                      hacia_salida = True,
+                                                      k_gap_width = 0.5)
+
+        if not(k0 is None):
+        
+            d = dibujar_elemento_serie(d, Capacitor, 1/k0)
+            
+        if not(koo is None):
+        
+            d = dibujar_elemento_serie(d, Inductor, koo)
+            
+        if not(ki is None):
+
+            for un_tanque in ki:
+                
+                d = dibujar_tanque_serie(d, inductor_lbl = 1/un_tanque[0], capacitor_lbl = un_tanque[1] )
+
+                dibujar_espacio_derivacion(d)
+
+
+        d += Line().right().length(d.unit*.25)
+        d += Line().down()
+        d += Line().left().length(d.unit*.25)
+        
+        display(d)
+        
+        return(d)
+
+    else:    
+        
+        print('Nada para dibujar')
+
+
+
+def foster( imm ):
+    '''
+    Parameters
+    ----------
+    immittance : symbolic rational function
+        La inmitancia a sintetizar.
+
+    Returns
+    -------
+    Una lista imm_list con los elementos obtenidos de la siguientes expansión en 
+    fracciones simples:
+        
+        Imm = k0 / s + koo * s +  1 / ( k0_i / s + koo_i * s ) 
+
+
+    imm_list = [ k0, koo, [k00, koo0], [k01, koo1], ..., [k0N, kooN]  ]
+    
+    Si algún elemento no está presente, su valor será de "None".
+
+    Ejemplo
+    -------
+    
+    # Sea la siguiente función de excitación
+    Imm = (2*s**4 + 20*s**2 + 18)/(s**3 + 4*s)
+    
+    # Implementaremos Imm mediante Foster
+    k0, koo, ki = tc2.foster(Imm)
+
+
+    '''    
+        
+    imm_foster = apart(imm)
+    
+    all_terms = imm_foster.as_ordered_terms()
+    
+    k0 = None
+    koo = None
+    ki = []
+    ii = 0
+    
+    for this_term in all_terms:
+        
+        num, den = this_term.as_numer_denom()
+        
+        if sp.degree(num) == 1 and sp.degree(den) == 0:
+        
+            koo = num.as_poly(s).LC() / den
+            
+        elif sp.degree(den) == 1 and sp.degree(num) == 0:
+            
+            k0 = den.as_poly(s).LC() / num
+    
+        elif sp.degree(num) == 1 and sp.degree(den) == 2:
+            # tanque
+            tank_el = (den / num).expand().as_ordered_terms()
+    
+            koo_i = None
+            k0_i = None
+            
+            for this_el in tank_el:
+                
+                num, den = this_el.as_numer_denom()
+                
+                if sp.degree(num) == 1 and sp.degree(den) == 0:
+                
+                    koo_i = num.as_poly(s).LC() / den
+    
+                elif sp.degree(den) == 1 and sp.degree(num) == 0:
+                    
+                    k0_i = num / den.as_poly(s).LC() 
+                    
+            
+            ki += [[k0_i, koo_i]]
+            ii += 1
+            
+        else:
+            # error
+            assert('Error al expandir en fracciones simples.')
+    
+    if ii == 0:
+        ki = None
+
+    return([k0, koo, ki])
+
+
 
 
 def parametrize_sos(num, den):
@@ -231,13 +1085,13 @@ def parametrize_sos(num, den):
 
 def simplify_n_monic(tt):
     
-    num, den = sp.fraction(tt)
+    num, den = sp.fraction(sp.simplify(sp.expand(tt)))
     
     num = sp.poly(num,s)
     den = sp.poly(den,s)
     
-    lcnum = sp.LC(num)
-    lcden = sp.LC(den)
+    # lcnum = sp.LC(num)
+    # lcden = sp.LC(den)
     
     k = num.LC() / den.LC()
     
@@ -248,19 +1102,19 @@ def simplify_n_monic(tt):
 
 def pp(z1, z2):
     '''
-    Convierte la MAD en MAI luego de levantar de referencia.
+    Asocia en paralelo dos impedancias o en serie dos admitancias.
 
     Parameters
     ----------
-    Ymai : Symbolic Matrix
-        Matriz admitancia indefinida.
-    nodes2del : list or integer
-        Nodos que se van a eliminar.
+    z1 : Symbolic
+        Impedancia 1.
+    z2 : Symbolic
+        Impedancia 2.
 
     Returns
     -------
-    YY : Symbolic Matrix
-        Matriz admitancia 
+    zp : Symbolic
+         Impedancia resultante.
 
     '''
 
@@ -303,33 +1157,6 @@ def I2T(gamma, z01, z02 = None):
     
     return(TT)
 
-def I2T_s(gamma, z01, z02 = None):
-    '''
-    Convierte la MAD en MAI luego de levantar de referencia.
-
-    Parameters
-    ----------
-    Ymai : Symbolic Matrix
-        Matriz admitancia indefinida.
-    nodes2del : list or integer
-        Nodos que se van a eliminar.
-
-    Returns
-    -------
-    YY : Symbolic Matrix
-        Matriz admitancia 
-
-    '''
-    if z02 is None:
-        z02 = z01
-    
-    TT = sp.Matrix([[sp.cosh(gamma)*sp.sqrt(z01/z02),
-                     sp.sinh(gamma)*sp.sqrt(z01*z02)], 
-                    [sp.sinh(gamma)/sp.sqrt(z01*z02),
-                     sp.cosh(gamma)*sp.sqrt(z02/z01)]])
-    
-    
-    return(TT)
 
 def I2T_s(gamma, z01, z02 = None):
     '''
@@ -360,9 +1187,145 @@ def I2T_s(gamma, z01, z02 = None):
     return(TT)
 
 
-'''
-    Bloque de funciones para dibujar redes de forma bonita
-'''
+#############################################
+#%% Funciones para dibujar redes en LTspice #
+#############################################
+
+def ltsp_nuevo_circuito(circ_name=None):
+
+    global cap_num, res_num, ind_num, cur_x, cur_y
+
+    if circ_name is None:
+
+        timestr = time.strftime("%Y%m%d-%H%M%S")
+        circ_name = 'NN-' + timestr
+
+    circ_hdl = None
+    
+    src_fname = path.join('.', filename_eq_base + '.asc' )
+    
+    if path.isfile(src_fname):
+        
+        dst_fname = 'pyltspice_{:s}.asc'.format(circ_name)
+        
+        shutil.copy(src_fname, dst_fname)
+    
+        # configuración de los gráficos standard S11 / S21
+        src_fname = path.join('.', filename_eq_base + '.plt' )
+        
+        dst_fname = 'pyltspice_{:s}.plt'.format(circ_name)
+        
+        shutil.copy(src_fname, dst_fname)
+        
+        circ_hdl = open(dst_fname, 'a')
+        
+        cap_num = 1
+        res_num = 1
+        ind_num = 1
+
+        cur_x = 0
+        cur_y = 0
+        
+    else:
+        print("No se encontró el archivo {}".format(src_fname))
+    
+    return(circ_hdl)
+
+def ltsp_capa_derivacion(circ_hdl, cap_value, cap_label=None):
+    
+    global cap_der_str, cap_num
+    
+    if cap_label is None:
+        
+        cap_label = 'C{:d}'.format(cap_num)
+        cap_num += 1
+
+    assert isinstance(cap_value, np.number) or isinstance(cap_value, sp.Number ) , 'Se espera un valor numérico para el componente.'
+
+    assert cap_value > 0, 'Se necesita un valor positivo de componente.' 
+
+    this_cap_str = cap_der_str.copy()
+    
+    element_xy = [cur_x - ltux, cur_y + lt_wire_length*ltuy]
+    
+    this_cap_str[0] = this_cap_str[0].format(element_xy[0], element_xy[1])
+    this_cap_str[3] = this_cap_str[3].format(cap_label)
+    this_cap_str[4] = this_cap_str[4].format(cap_value)
+
+    # conectamos el elemento en derivación con el cursor actual.
+    wire_str = 'WIRE {:d} {:d} {:d} {:d}\n'.format(cur_x, cur_y, element_xy[0] + ltux, element_xy[1] )
+    # y el otro extremo a referencia GND
+    gnd_str = 'FLAG {:d} {:d} 0\n'.format(element_xy[0] + ltux, element_xy[1] + 4*ltuy )
+
+    circ_hdl.writelines(wire_str)
+    circ_hdl.writelines(this_cap_str)
+    circ_hdl.writelines(gnd_str)
+    
+    return()
+
+
+
+def ltsp_ind_serie(circ_hdl, ind_value, ind_label=None):
+    
+    global ind_ser_str, cap_num, cur_x, cur_y
+    
+    if ind_label is None:
+        
+        ind_label = 'C{:d}'.format(cap_num)
+        cap_num += 1
+
+    assert isinstance(ind_value, np.number) or isinstance(ind_value, sp.Number ) , 'Se espera un valor numérico para el componente.'
+
+    assert ind_value > 0, 'Se necesita un valor positivo de componente.' 
+
+    this_ind_str = ind_ser_str.copy()
+    
+    element_xy = [cur_x + lt_wire_length*ltux, cur_y + ltuy]
+    
+    this_ind_str[0] = this_ind_str[0].format(element_xy[0], element_xy[1])
+    this_ind_str[3] = this_ind_str[3].format(ind_label)
+    this_ind_str[4] = this_ind_str[4].format(ind_value)
+
+    # conectamos el elemento en serie con el cursor actual, y el otro extremo
+    # al siguiente elemento.
+    
+    next_x = element_xy[0] + 6*ltux + lt_wire_length*ltux
+    next_y = element_xy[1] - ltuy
+    
+    wire_str = ['WIRE {:d} {:d} {:d} {:d}\n'.format(cur_x, cur_y, element_xy[0] + ltux, element_xy[1] - ltuy), 
+                'WIRE {:d} {:d} {:d} {:d}\n'.format(element_xy[0] + 6*ltux, element_xy[1] - ltuy, next_x, next_y) ]
+
+    # actualizamos cursor.    
+    cur_x = next_x
+    cur_y = next_y
+
+    circ_hdl.writelines(wire_str)
+    circ_hdl.writelines(this_ind_str)
+    
+    return()
+
+
+def ltsp_etiquetar_nodo(circ_hdl, node_label=None):
+    
+    global cap_der_str, node_num, cur_x, cur_y
+    
+    if node_label is None:
+        
+        node_label = 'v{:d}'.format(node_num)
+        node_num += 1
+
+    flag_str = ['FLAG {:d} {:d} {:s}\n'.format(cur_x, cur_y, node_label) ]
+
+    circ_hdl.writelines(flag_str)
+    
+    return()
+
+
+
+##################################################
+#%% Funciones para dibujar redes de forma bonita #
+##################################################
+
 
 def dibujar_puerto_entrada(d, port_name = None, voltage_lbl = None, current_lbl = None):
     
@@ -450,7 +1413,18 @@ def dibujar_funcion_exc_abajo(d, func_label, sym_func, k_gap_width=0.5, hacia_sa
     d.push()
     d += Gap().down().label('')
     d.push()
-    lbl = d.add(Gap().down().label( '$ ' + func_label + ' = ' + sp.latex(sym_func) + ' $', fontsize=22 ).length(0.5*half_width))
+    
+    if isinstance(sym_func, sp.Mul ) or isinstance(sym_func, sp.Number ):
+        sym_func = '$ ' + func_label + ' = $' + sp.latex(sym_func)
+    elif isinstance(sym_func, np.number):
+        sym_func =  '$ ' + func_label + ' = ' + '{:3.3f}'.format(sym_func) + ' $'
+    elif isinstance(sym_func, str):
+        sym_func = '$ ' + func_label + ' = ' +  sym_func + ' $'
+    else:
+        sym_func = '$ ' + func_label + ' = ?? $'
+    
+    lbl = d.add(Gap().down().label( sym_func, fontsize=22 ).length(0.5*half_width))
+    d += Gap().down().label('').length(0.5*half_width)
     d.pop()
     d.push()
     d += Line().up().at( (d.here.x, d.here.y - .2 * half_width) ).length(half_width).linewidth(1)
@@ -479,7 +1453,18 @@ def dibujar_funcion_exc_arriba(d, func_label, sym_func, k_gap_width=0.5, hacia_s
     
     d += Line().right().length(half_width)
     d.push()
-    lbl = d.add(Gap().up().label( '$ ' + func_label + ' = ' + sp.latex(sym_func) + ' $', fontsize=22 ).length(3* half_width))
+    
+    if isinstance(sym_func, sp.Mul ) or isinstance(sym_func, sp.Number ):
+        sym_func = '$ ' + func_label + ' = $' + sp.latex(sym_func)
+    elif isinstance(sym_func, np.number):
+        sym_func =  '$ ' + func_label + ' = ' + '{:3.3f}'.format(sym_func) + ' $'
+    elif isinstance(sym_func, str):
+        sym_func = '$ ' + func_label + ' = ' +  sym_func + ' $'
+    else:
+        sym_func = '$ ' + func_label + ' = ?? $'
+
+    
+    lbl = d.add(Gap().up().label( sym_func, fontsize=22 ).length(3* half_width))
     d.pop()
     d.push()
     d += Line().down().at( (d.here.x, d.here.y + .2 * half_width) ).length(half_width).linewidth(1)
@@ -526,6 +1511,16 @@ def dibujar_elemento_serie(d, elemento, sym_label=''):
 
     return(d)
 
+def dibujar_espacio_derivacion(d):
+
+    d += Line().right().length(d.unit*.25)
+    d.push()
+    d += Gap().down().label( '' )
+    d += Line().left().length(d.unit*.25)
+    d.pop()
+
+    return(d)
+
 def dibujar_elemento_derivacion(d, elemento, sym_label=''):
     
     if isinstance(sym_label, sp.Number ):
@@ -546,24 +1541,24 @@ def dibujar_elemento_derivacion(d, elemento, sym_label=''):
     return(d)
 
 
-def dibujar_tanque_serie(d, sym_ind_label='', sym_cap_label=''):
+def dibujar_tanque_RC_serie(d, sym_R_label='', capacitor_lbl=''):
     
-    if isinstance(sym_ind_label, sp.Number ):
-        sym_ind_label = to_latex(sym_ind_label)
+    if isinstance(sym_R_label, sp.Number ):
+        sym_R_label = to_latex(sym_R_label)
     else:
-        sym_ind_label = str_to_latex(sym_ind_label)
+        sym_R_label = str_to_latex(sym_R_label)
     
-    if isinstance(sym_cap_label, sp.Number ):
-        sym_cap_label = to_latex(sym_cap_label)
+    if isinstance(capacitor_lbl, sp.Number ):
+        capacitor_lbl = to_latex(capacitor_lbl)
     else:
-        sym_cap_label = str_to_latex(sym_cap_label)
+        capacitor_lbl = str_to_latex(capacitor_lbl)
     
     d.push()
     d += Dot()
-    d += Capacitor().right().label(sym_cap_label, fontsize=16)
+    d += Capacitor().right().label(capacitor_lbl, fontsize=16)
     d.pop()
     d += Line().up().length(d.unit*.5)
-    d += Inductor().right().label(sym_ind_label, fontsize=16)
+    d += Resistor().right().label(sym_R_label, fontsize=16)
     d += Line().down().length(d.unit*.5)
     d += Dot()
     d.push()
@@ -573,22 +1568,166 @@ def dibujar_tanque_serie(d, sym_ind_label='', sym_cap_label=''):
 
     return(d)
 
-def dibujar_tanque_derivacion(d, sym_ind_label='', sym_cap_label=''):
+def dibujar_tanque_RC_derivacion(d, sym_R_label='', capacitor_lbl=''):
+    
+    if isinstance(sym_R_label, sp.Number ):
+        sym_R_label = to_latex(sym_R_label)
+    else:
+        sym_R_label = str_to_latex(sym_R_label)
+    
+    if isinstance(capacitor_lbl, sp.Number ):
+        capacitor_lbl = to_latex(capacitor_lbl)
+    else:
+        capacitor_lbl = str_to_latex(capacitor_lbl)
+    
+    d.push()
+    d += Dot()
+    d += Capacitor().down().label(capacitor_lbl, fontsize=16).length(d.unit*.5)
+    d += Resistor().down().label(sym_R_label, fontsize=16).length(d.unit*.5)
+    d += Dot()
+    d.pop()
+
+    return(d)
+
+def dibujar_tanque_RL_serie(d, sym_R_label='', sym_ind_label=''):
+    
+    if isinstance(sym_R_label, sp.Number ):
+        sym_R_label = to_latex(sym_R_label)
+    else:
+        sym_R_label = str_to_latex(sym_R_label)
     
     if isinstance(sym_ind_label, sp.Number ):
         sym_ind_label = to_latex(sym_ind_label)
     else:
         sym_ind_label = str_to_latex(sym_ind_label)
     
+    d.push()
+    d += Dot()
+    d += Inductor().right().label(sym_ind_label, fontsize=16)
+    d.pop()
+    d += Line().up().length(d.unit*.5)
+    d += Resistor().right().label(sym_R_label, fontsize=16)
+    d += Line().down().length(d.unit*.5)
+    d += Dot()
+    d.push()
+    d += Gap().down().label( '' )
+    d += Line().left()
+    d.pop()
+
+    return(d)
+
+def dibujar_tanque_RL_derivacion(d, sym_R_label='', sym_ind_label=''):
+    
+    if isinstance(sym_R_label, sp.Number ):
+        sym_R_label = to_latex(sym_R_label)
+    else:
+        sym_R_label = str_to_latex(sym_R_label)
+    
+    if isinstance(sym_ind_label, sp.Number ):
+        sym_ind_label = to_latex(sym_ind_label)
+    else:
+        sym_ind_label = str_to_latex(sym_ind_label)
+    
+    d.push()
+    d += Dot()
+    d += Inductor().down().label(sym_ind_label, fontsize=16).length(d.unit*.5)
+    d += Resistor().down().label(sym_R_label, fontsize=16).length(d.unit*.5)
+    d += Dot()
+    d.pop()
+
+    return(d)
+
+def dibujar_tanque_serie(d, sym_ind_label='', sym_cap_label=''):
+    
     if isinstance(sym_cap_label, sp.Number ):
         sym_cap_label = to_latex(sym_cap_label)
     else:
         sym_cap_label = str_to_latex(sym_cap_label)
     
+    if isinstance(sym_ind_label, sp.Number ):
+        sym_ind_label = to_latex(sym_ind_label)
+    else:
+        sym_ind_label = str_to_latex(sym_ind_label)
+    
     d.push()
     d += Dot()
-    d += Capacitor().down().label(sym_cap_label, fontsize=16).length(d.unit*.5)
-    d += Inductor().down().label(sym_ind_label, fontsize=16).length(d.unit*.5)
+    d += Inductor().right().label(sym_ind_label, fontsize=16)
+    d.pop()
+    d += Line().up().length(d.unit*.5)
+    d += Resistor().right().label(sym_cap_label, fontsize=16)
+    d += Line().down().length(d.unit*.5)
+    d += Dot()
+    d.push()
+    d += Gap().down().label( '' )
+    d += Line().left()
+    d.pop()
+
+    return(d)
+
+# def dibujar_tanque_RL_derivacion(d, sym_R_label='', inductor_lbl=''):
+    
+#     if isinstance(sym_R_label, sp.Number ):
+#         sym_R_label = to_latex(sym_R_label)
+#     else:
+#         sym_R_label = str_to_latex(sym_R_label)
+    
+#     if isinstance(inductor_lbl, sp.Number ):
+#         inductor_lbl = to_latex(inductor_lbl)
+#     else:
+#         inductor_lbl = str_to_latex(inductor_lbl)
+    
+#     d.push()
+#     d += Dot()
+#     d += Inductor().down().label(inductor_lbl, fontsize=16).length(d.unit*.5)
+#     d += Resistor().down().label(sym_R_label, fontsize=16).length(d.unit*.5)
+#     d += Dot()
+#     d.pop()
+
+#     return(d)
+
+# def dibujar_tanque_serie(d, inductor_lbl='', capacitor_lbl=''):
+    
+#     if isinstance(inductor_lbl, sp.Number ):
+#         inductor_lbl = to_latex(inductor_lbl)
+#     else:
+#         inductor_lbl = str_to_latex(inductor_lbl)
+    
+#     if isinstance(capacitor_lbl, sp.Number ):
+#         capacitor_lbl = to_latex(capacitor_lbl)
+#     else:
+#         capacitor_lbl = str_to_latex(capacitor_lbl)
+    
+#     d.push()
+#     d += Dot()
+#     d += Capacitor().right().label(capacitor_lbl, fontsize=16)
+#     d.pop()
+#     d += Line().up().length(d.unit*.5)
+#     d += Inductor().right().label(inductor_lbl, fontsize=16)
+#     d += Line().down().length(d.unit*.5)
+#     d += Dot()
+#     d.push()
+#     d += Gap().down().label( '' )
+#     d += Line().left()
+#     d.pop()
+
+#     return(d)
+
+def dibujar_tanque_derivacion(d, inductor_lbl='', capacitor_lbl=''):
+    
+    if isinstance(inductor_lbl, sp.Number ):
+        inductor_lbl = to_latex(inductor_lbl)
+    else:
+        inductor_lbl = str_to_latex(inductor_lbl)
+    
+    if isinstance(capacitor_lbl, sp.Number ):
+        capacitor_lbl = to_latex(capacitor_lbl)
+    else:
+        capacitor_lbl = str_to_latex(capacitor_lbl)
+    
+    d.push()
+    d += Dot()
+    d += Capacitor().down().label(capacitor_lbl, fontsize=16).length(d.unit*.5)
+    d += Inductor().down().label(inductor_lbl, fontsize=16).length(d.unit*.5)
     d += Dot()
     d.pop()
 
@@ -599,9 +1738,124 @@ def dibujar_tanque_derivacion(d, sym_ind_label='', sym_cap_label=''):
     Bloque de funciones para la síntesis gráfica de imitancias
 '''
 
-s = sp.symbols('s ', complex=True)
+def remover_polo_sigma( imm, sigma, isImpedance = True,  isRC = True,  sigma_zero = None ):
+    '''
+    Se removerá el residuo en sobre el eje $\sigma$ (sigma) de la impedancia (zz) 
+    o admitancia (yy) de forma completa, o parcial en el caso que se especifique una 
+    sigma_i.
+    Como resultado de la remoción, quedará otra función racional definida
+    como:
+        
+    $$ Z_{R}= Z - \frac{k_i}{s + \sigma_i} $$
+    
+    siendo 
 
-def remover_polo_jw( imit, omega, omega_zero = None ):
+    $$ k=\lim\limits _{s\to -\sigma_i} Z (s + \sigma_i) $$
+    
+    En cuanto se especifique sigma_i, la remoción parcial estará definida 
+    como
+
+    $$ Z_{R}\biggr\rfloor_{s=-\sigma_i}= 0 = Z - \frac{k_i}{s + \sigma_i}\biggr\rfloor_{s=-\sigma_i} $$
+    
+    siendo 
+    
+    $$ k = Z.(\frac{)s + \sigma_i)\biggr\rfloor_{s=-\sigma_i} $$
+    
+
+    Parameters
+    ----------
+    zz o yy: Symbolic
+        Impedancia o admitancia que se utilizará para la remoción. Es una función racional 
+        simbólica que tendrá un polo de orden 1 en \omega.
+    omega_zero : Symbolic
+        Frecuencia a la que la imitancia será cero luego de la remoción.
+
+    Returns
+    -------
+    imit_r : Symbolic
+        Imitancia luego de la remoción
+    k : Symbolic
+        Valor del residuo.
+    '''
+
+    if isImpedance:
+        zz = imm
+    else:
+        yy = imm
+
+    if sigma_zero is None:
+        # remoción total
+        
+        if isImpedance:
+            if isRC:
+                kk = sp.limit(zz*(s + sigma), s, -sigma)
+            else:
+                # RL
+                kk = sp.limit(zz*(s + sigma)/s, s, -sigma)
+                
+        else:
+            if isRC:
+                kk = sp.limit(yy*(s + sigma)/s, s, -sigma)
+            else:
+                kk = sp.limit(yy*(s + sigma), s, -sigma)
+        
+        if kk.is_negative:
+            assert('Residuo negativo. Verificar Z/Y RC/RL')
+        
+    else:
+        # remoción parcial
+        if isImpedance:
+            if isRC:
+                kk = sp.simplify(sp.expand(zz*(s + sigma))).subs(s, -sigma_zero)
+            else:
+                kk = sp.simplify(sp.expand(zz*(s + sigma)/s)).subs(s, -sigma_zero)
+            
+        else:
+            if isRC:
+                kk = sp.simplify(sp.expand(yy*(s + sigma)/s)).subs(s, -sigma_zero)
+            else:
+                kk = sp.simplify(sp.expand(yy*(s + sigma))).subs(s, -sigma_zero)
+
+        if kk.is_negative:
+            assert('Residuo negativo. Verificar Z/Y RC/RL')
+    
+    # extraigo kk
+    if isImpedance:
+        if isRC:
+            # Z_RC        
+            R = kk/sigma
+            CoL = 1/kk
+            kk  = kk/(s+sigma)
+        else:
+            # Z_RL        
+            R = kk
+            CoL = kk/sigma
+            kk  = kk*s/(s+sigma)
+        
+    else:
+
+        if isRC:
+            # Y_RC        
+            CoL = kk/sigma
+            R = 1/kk
+            kk  = kk*s/(s+sigma)
+        else:
+            # Y_RL
+            R = sigma/kk
+            CoL = 1/kk
+            kk  = kk/(s+sigma)
+        
+
+    if isImpedance:
+        imit_r = sp.factor(sp.simplify(sp.expand(zz - kk)))
+    
+    else:
+    
+        imit_r = sp.factor(sp.simplify(sp.expand(yy - kk)))
+
+    return( [imit_r, kk, R, CoL] )
+
+def remover_polo_jw( imit, omega = None , isImpedance = True, omega_zero = None ):
     '''
     Se removerá el residuo en sobre el eje $j.\omega$ (omega) de la imitancia 
     $I$ (imit) de forma completa, o parcial en el caso que se especifique una 
@@ -641,6 +1895,20 @@ def remover_polo_jw( imit, omega, omega_zero = None ):
         Valor del residuo en infinito
     '''
 
+    if omega is None:
+        # busco el primer polo finito en imit sobre el jw
+        
+        _, den = (imit).as_numer_denom()
+        faux = sp.factor_list(den)
+        
+        if sp.degree(faux[1][0][0]) == 2:
+            
+            tt = faux[1][0][0].as_ordered_terms()
+            
+            # el último término sería omega**2. Cada factor sería
+            # s**2 + omega**2
+            omega = sp.sqrt(tt[-1])
+
     if omega_zero is None:
         # remoción total
         # kk = sp.limit(imit*(s**2+omega**2)/s, s**2, -omega**2)
@@ -649,11 +1917,24 @@ def remover_polo_jw( imit, omega, omega_zero = None ):
     else:
         # remoción parcial
         kk = sp.simplify(sp.expand(imit*(s**2+omega**2)/s)).subs(s**2, -(omega_zero**2) )
+
+    
+    if isImpedance:
+        # Z_LC
+        L = kk/omega**2
+        C = 1/kk
+        
+    else:
+        # Y_LC
+        C = kk/omega**2
+        L = 1/kk
+
+    kk = kk * s / (s**2+omega**2)
     
     # extraigo kk
-    imit_r = sp.factor(sp.simplify(sp.expand(imit - kk*s/(s**2+omega**2))))
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - kk)))
 
-    return( [imit_r, kk] )
+    return( [imit_r, kk, L, C] )
 
 def remover_polo_dc( imit, omega_zero = None ):
     '''
@@ -697,15 +1978,16 @@ def remover_polo_dc( imit, omega_zero = None ):
 
     if omega_zero is None:
         # remoción total
-        k_cero = sp.limit(imit*s, s, sp.oo)
+        k_cero = sp.limit(imit*s, s, 0)
         
     else:
         # remoción parcial
         k_cero = sp.simplify(sp.expand(imit*s)).subs(s**2, -(omega_zero**2) )
 
+    k_cero = k_cero/s
     
     # extraigo C3
-    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_cero/s)))
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_cero)))
 
     return( [imit_r, k_cero] )
 
@@ -757,11 +2039,119 @@ def remover_polo_infinito( imit, omega_zero = None ):
         # remoción parcial
         k_inf = sp.simplify(sp.expand(imit/s)).subs(s**2, -(omega_zero**2) )
 
-    
+    k_inf = k_inf * s
+
     # extraigo C3
-    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_inf*s)))
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_inf)))
 
     return( [imit_r, k_inf] )
+
+def remover_valor( imit, sigma_zero):
+    '''
+    Se removerá un valor constante de la imitancia ($I$) de forma 
+    que al removerlo, la imitancia luego de la remoción ($I_R$) tenga 
+    un cero en sigma_zero. Es decir:
+
+    $$ I_{R}\biggr\rfloor_{s = -\sigma_z} = 0 = (I - k_{\infty}^{'})\biggr\rfloor_{s = -\sigma_z} $$
+    
+    siendo 
+    
+    $$ k_{\infty}^{'}= I\biggr\rfloor_{s = -\sigma_z} $$
+
+    Parameters
+    ----------
+    imit : Symbolic
+        Imitancia que se utilizará para la remoción. Es una función racional 
+        simbólica que tendrá un valor constante en infinito (mayor a su valor en s=0).
+        
+    omega_zero : Symbolic
+        Frecuencia a la que la imitancia será cero luego de la remoción.
+
+    Returns
+    -------
+    imit_r : Symbolic
+        Imitancia luego de la remoción
+    k_inf : Symbolic
+        Valor del residuo en infinito
+    '''
+
+    # remoción parcial
+    k_prima = sp.simplify(sp.expand(imit)).subs(s, -sigma_zero)
+    
+    # extraigo k_prima
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_prima)))
+
+    return( [imit_r, k_prima] )
+
+def remover_valor_en_infinito( imit ):
+    '''
+    Se removerá un valor constante en infinito de la imitancia ($I$) de forma 
+    completa. 
+    Como resultado de la remoción, quedará otra función racional definida
+    como:
+        
+    $$ I_R = I - k_{\infty}  $$
+    
+    siendo 
+
+    $$ k_{\infty}=\lim\limits _{s\to\infty}I $$
+
+    Parameters
+    ----------
+    imit : Symbolic
+        Imitancia que se utilizará para la remoción. Es una función racional 
+        simbólica que tendrá un valor constante en infinito (mayor a su valor en s=0).
+
+    Returns
+    -------
+    imit_r : Symbolic
+        Imitancia luego de la remoción
+    k_inf : Symbolic
+        Valor del residuo en infinito
+    '''
+
+    # remoción total
+    k_inf = sp.limit(imit, s, sp.oo)
+
+    # extraigo k_inf
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - k_inf)))
+
+    return( [imit_r, k_inf] )
+
+def remover_valor_en_dc( imit ):
+    '''
+    Se removerá un valor constante en continua (s=0) de la imitancia ($I$) de forma 
+    completa. 
+    Como resultado de la remoción, quedará otra función racional definida
+    como:
+        
+    $$ I_R = I - k_0  $$
+    
+    siendo 
+
+    $$ k_0 = \lim\limits _{s \to 0}I $$
+    
+    Parameters
+    ----------
+    imit : Symbolic
+        Imitancia que se utilizará para la remoción. Es una función racional 
+        simbólica que tendrá un valor constante en infinito (mayor a su valor en s=0).
+        
+    Returns
+    -------
+    imit_r : Symbolic
+        Imitancia luego de la remoción
+    k_inf : Symbolic
+        Valor del residuo en infinito
+    '''
+
+    # remoción total
+    k0 = sp.limit(imit, s, 0)
+        
+    # extraigo k0
+    imit_r = sp.factor(sp.simplify(sp.expand(imit - k0)))
+
+    return( [imit_r, k0] )
 
 
 def tanque_z( doska, omegasq ):
@@ -835,6 +2225,333 @@ def str_to_latex( unstr):
 '''
     Funciones de conversión de matrices de cuadripolos lineales
 '''
+
+def S2Ts_s(Spar):
+    '''
+    Convierte una matriz de parámetros scattering (S) simbólica 
+    al modelo de parámetros transferencia de scattering (Ts).
+
+    Parameters
+    ----------
+    Spar : Symbolic Matrix
+        Matriz de parámetros S.
+
+    Returns
+    -------
+    Ts : Symbolic Matrix
+        Matriz de parámetros de transferencia scattering.
+
+    '''
+    
+    Ts = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Ts[0,0] = sp.Rational('1')
+    # B = DZ/Z21
+    Ts[0,1] = -Spar[1,1]
+    # C = 1/Z21
+    Ts[1,0] = Spar[0,0]
+    # D = Z22/Z21
+    Ts[1,1] = -sp.simplify(sp.expand(sp.Determinant(Spar)))
+    
+    return( sp.simplify(sp.expand(1 / Spar[1,0] * Ts) ) ) 
+
+def Ts2S_s(Ts):
+    '''
+    Convierte una matriz de transferencia de scattering (Ts) simbólica 
+    al modelo de parámetros scattering (S).
+
+    Parameters
+    ----------
+    Ts : Symbolic Matrix
+        Matriz de parámetros S.
+
+    Returns
+    -------
+    Spar : Symbolic Matrix
+        Matriz de parámetros de scattering.
+
+    '''
+    
+    Spar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Spar[0,0] = Ts[1,0]
+    # B = DZ/Z21
+    Spar[0,1] = sp.simplify(sp.expand(sp.Determinant(Ts)))
+    # C = 1/Z21
+    Spar[1,0] = sp.Rational('1') 
+    # D = Z22/Z21
+    Spar[1,1] = -Ts[0,1] 
+    
+    return( sp.simplify(sp.expand( 1 / Ts[0,0] * Spar ) ) ) 
+
+def Tabcd2S_s(Tabcd, Z0 = sp.Rational('1') ):
+    '''
+    Convierte una matriz de parámetros ABCD (Tabcd) simbólica 
+    al modelo de parámetros scattering (S).
+
+    Parameters
+    ----------
+    Ts : Symbolic Matrix
+        Matriz de parámetros S.
+
+    Returns
+    -------
+    Spar : Symbolic Matrix
+        Matriz de parámetros de scattering.
+
+    '''
+    
+    Spar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Spar[0,0] = Tabcd[0,0] + Tabcd[0,1]/Z0 - Tabcd[1,0]*Z0 - Tabcd[1,1]
+    # B = DZ/Z21
+    Spar[0,1] = 2 * sp.simplify(sp.expand(sp.Determinant(Tabcd)))
+    # C = 1/Z21
+    Spar[1,0] = sp.Rational('2') 
+    # D = Z22/Z21
+    Spar[1,1] = -Tabcd[0,0] + Tabcd[0,1]/Z0 - Tabcd[1,0]*Z0 + Tabcd[1,1]
+    
+    common = Tabcd[0,0] + Tabcd[0,1]/Z0 + Tabcd[1,0]*Z0 + Tabcd[1,1]
+    
+    return( sp.simplify(sp.expand( 1 / common * Spar ) ) ) 
+
+def S2Tabcd_s(Spar, Z0 = sp.Rational('1') ):
+    '''
+    Convierte una matriz de parámetros ABCD (Tabcd) simbólica 
+    al modelo de parámetros scattering (S).
+
+    Parameters
+    ----------
+    Ts : Symbolic Matrix
+        Matriz de parámetros S.
+
+    Returns
+    -------
+    Spar : Symbolic Matrix
+        Matriz de parámetros de scattering.
+
+    '''
+    
+    Tabcd = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tabcd[0,0] = (1 - Spar[0,0]) * (1 + Spar[1,1]) + Spar[1,0] * Spar[0,1]
+    # B = DZ/Z21
+    Tabcd[0,1] = Z0*((1 + Spar[0,0]) * (1 + Spar[1,1]) - Spar[1,0] * Spar[0,1])
+    # C = 1/Z21
+    Tabcd[1,0] = 1/Z0*((1 - Spar[0,0]) * (1 - Spar[1,1]) - Spar[1,0] * Spar[0,1])
+    # D = Z22/Z21
+    Tabcd[1,1] = (1 - Spar[0,0]) * (1 + Spar[1,1]) + Spar[1,0] * Spar[0,1]
+    
+    return( sp.simplify(sp.expand( 1 / 2 / Spar[1,0] * Tabcd ) ) ) 
+
+def SparZ_s(Zexc, Z01=sp.Rational('1'), Z02=sp.Rational('1')):
+    '''
+    Convierte una matriz de transferencia de scattering (Ts) simbólica 
+    al modelo de parámetros scattering (S).
+
+    Parameters
+    ----------
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+
+    Z01 : Symbolic impedance
+          Impedancia de referencia en el plano 1
+
+    Z02 : Symbolic impedance
+          Impedancia de referencia en el plano 2
+
+    Returns
+    -------
+    Spar : Symbolic Matrix
+           Matriz de parámetros de scattering de Z.
+
+    '''
+    
+    Spar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Spar[0,0] = Zexc
+    # B = DZ/Z21
+    Spar[0,1] = 2*Z01
+    # C = 1/Z21
+    Spar[1,0] = 2*Z01
+    # D = Z22/Z21
+    Spar[1,1] = Zexc 
+    
+    return( sp.simplify(sp.expand( 1 / (Zexc + 2*Z01) * Spar) ) ) 
+
+def SparY_s(Yexc, Y01=sp.Rational('1'), Y02=sp.Rational('1')):
+    '''
+    Convierte una matriz de transferencia de scattering (Ts) simbólica 
+    al modelo de parámetros scattering (S).
+
+    Parameters
+    ----------
+    Yexc : Symbolic impedance
+           Función de excitación de la admitancia a representar.
+
+    Y01 : Symbolic impedance
+          Admitancia de referencia en el plano 1
+
+    Y02 : Symbolic impedance
+          Admitancia de referencia en el plano 2
+
+    Returns
+    -------
+    Spar : Symbolic Matrix
+           Matriz de parámetros de scattering de Y.
+
+    '''
+    
+    Spar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Spar[0,0] = -Yexc
+    # B = DZ/Z21
+    Spar[0,1] = 2*Y01
+    # C = 1/Z21
+    Spar[1,0] = 2*Y01
+    # D = Z22/Z21
+    Spar[1,1] = -Yexc 
+    
+    return( sp.simplify(sp.expand( 1 / (Yexc + 2*Y01) * Spar) ) ) 
+
+def TabcdLYZ_s(Yexc, Zexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido por una Y en derivación seguida  por 
+    una Z en serie.
+
+    Parameters
+    ----------
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+    
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = sp.Rational('1')  
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = sp.Rational('1') + sp.simplify(sp.expand(Zexc * Yexc))
+    
+    return( Tpar ) 
+
+def TabcdLZY_s(Zexc, Yexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido por una Z en serie seguida una Y en 
+    derivación.
+
+    Parameters
+    ----------
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+    
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = sp.Rational('1') + sp.simplify(sp.expand(Zexc * Yexc))
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = sp.Rational('1')  
+    
+    return( Tpar ) 
+
+def TabcdZ_s(Zexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido únicamente por una Z en serie.
+
+    Parameters
+    ----------
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = sp.Rational('1') 
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = sp.Rational('0') 
+    # D = Z22/Z21
+    Tpar[1,1] = sp.Rational('1')  
+    
+    return( Tpar ) 
+
+
+def TabcdY_s(Yexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido únicamente por una Y en derivación.
+
+    Parameters
+    ----------
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = sp.Matrix([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = sp.Rational('1') 
+    # B = DZ/Z21
+    Tpar[0,1] = sp.Rational('0')
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = sp.Rational('1')  
+    
+    return( Tpar ) 
+
+
 
 def Y2T_s(YY):
     
@@ -1052,106 +2769,6 @@ def T2Y(TT):
     return(YY)
 
 
-def Z2tee(ZZ):
-    '''
-    Convierte la MAD en MAI luego de levantar de referencia.
-
-    Parameters
-    ----------
-    Ymai : Symbolic Matrix
-        Matriz admitancia indefinida.
-    nodes2del : list or integer
-        Nodos que se van a eliminar.
-
-    Returns
-    -------
-    YY : Symbolic Matrix
-        Matriz admitancia 
-
-    '''
-    
-    # Dibujo la red Tee
-    
-    d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
-    
-    d = dibujar_puerto_entrada(d,
-                                   port_name = 'In', 
-                                   voltage_lbl = ('+', '$V_1$', '-'), 
-                                   current_lbl = '$I_1$')
-    
-    Za = ZZ[0,0] - ZZ[0,1] 
-    Zb = ZZ[0,1] 
-    Zc = ZZ[1,1] - ZZ[0,1] 
-    
-    d = dibujar_elemento_serie(d, ResistorIEC, Za )
-    d = dibujar_elemento_derivacion(d, ResistorIEC, Zb )
-    d = dibujar_elemento_serie(d, ResistorIEC, Zc )
-    
-    d = dibujar_puerto_salida(d, 
-                                  port_name = 'Out', 
-                                  current_lbl = '$I_2$' )
-
-    display(d)        
-    
-    return([Za,Zb,Zc])
-
-
-def Y2Pi(YY):
-    '''
-    Convierte la MAD en MAI luego de levantar de referencia.
-
-    Parameters
-    ----------
-    Ymai : Symbolic Matrix
-        Matriz admitancia indefinida.
-    nodes2del : list or integer
-        Nodos que se van a eliminar.
-
-    Returns
-    -------
-    YY : Symbolic Matrix
-        Matriz admitancia 
-
-    '''
-    
-    # Dibujo la red Tee
-    
-    d = Drawing(unit=4)  # unit=2 makes elements have shorter than normal leads
-    
-    d = dibujar_puerto_entrada(d,
-                                   port_name = 'In', 
-                                   voltage_lbl = ('+', '$V_1$', '-'), 
-                                   current_lbl = '$I_1$')
-    
-    Ya = YY[0,0] + YY[0,1]
-    Yb = -YY[0,1]
-    Yc = YY[1,1] + YY[0,1]
-    
-    if isinstance(YY[0,0], sp.Symbol):
-        
-        Za = sp.simplify(sp.expand(1/Ya))
-        Zb = sp.simplify(sp.expand(1/Yb))
-        Zc = sp.simplify(sp.expand(1/Yc))
-        
-    else:
-
-        Za = 1/(YY[0,0] + YY[0,1])
-        Zb = 1/(-YY[0,1])
-        Zc = 1/(YY[1,1] + YY[0,1])
-    
-    d = dibujar_elemento_derivacion(d, ResistorIEC, Za )
-    d = dibujar_elemento_serie(d, ResistorIEC, Zb )
-    d = dibujar_elemento_derivacion(d, ResistorIEC, Zc )
-    
-    d = dibujar_puerto_salida(d, 
-                                  port_name = 'Out', 
-                                  current_lbl = '$I_2$' )
-    
-    display(d)        
-    
-    return([Ya, Yb, Yc])
-
-
 
 
 def y2mai(YY):
@@ -1205,6 +2822,139 @@ def may2y(Ymai, nodes2del):
         YY.col_del(ii)
     
     return(YY)
+
+
+def TabcdLYZ(Yexc, Zexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido por una Y en derivación seguida  por 
+    una Z en serie.
+
+    Parameters
+    ----------
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+    
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = np.array([[0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = 1 
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = 1 + Zexc * Yexc
+    
+    return( Tpar ) 
+
+def TabcdLZY(Zexc, Yexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido por una Z en serie seguida una Y en 
+    derivación.
+
+    Parameters
+    ----------
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+    
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = np.array([[0.0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = 1 + Zexc * Yexc 
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = 1
+    
+    return( Tpar ) 
+
+def TabcdZ(Zexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido únicamente por una Z en serie.
+
+    Parameters
+    ----------
+    Zexc : Symbolic impedance
+           Función de excitación de la impedancia a representar.
+
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = np.array([[0.0, 0.0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = 1 
+    # B = DZ/Z21
+    Tpar[0,1] = Zexc
+    # C = 1/Z21
+    Tpar[1,0] = 0
+    # D = Z22/Z21
+    Tpar[1,1] = 1
+
+    return( Tpar ) 
+
+def TabcdY(Yexc):
+    '''
+    Implementa una matriz de transferencia ABCD (Tabcd) a partir de 
+    un cuadripolo constituido únicamente por una Y en derivación.
+
+    Parameters
+    ----------
+    Yexc : Symbolic admitance
+           Función de excitación de la admitancia a representar.
+
+
+    Returns
+    -------
+    Tabcd : Symbolic Matrix
+           Matriz de parámetros ABCD.
+
+    '''
+    
+    Tpar = np.array([[0.0, 0], [0, 0]])
+    
+    # A = Z11/Z21
+    Tpar[0,0] = 1 
+    # B = DZ/Z21
+    Tpar[0,1] = 0
+    # C = 1/Z21
+    Tpar[1,0] = Yexc
+    # D = Z22/Z21
+    Tpar[1,1] = 1
+    
+    return( Tpar ) 
+
+
 
 
 def calc_MAI_ztransf_ij_mn(Ymai, ii=2, jj=3, mm=0, nn=1, verbose=False):
@@ -1327,33 +3077,130 @@ Otras funciones
 
 '''
 
+
+def db2nepper(at_en_db):
+    
+    return( at_en_db/(20*np.log10(np.exp(1))) )
+
+def nepper2db(at_en_np):
+    
+    return( at_en_np*(20*np.log10(np.exp(1))) )
+
+
+def Chebyshev_polynomials(nn):
+    
+    Cn_pp = 1
+    Cn_p = w
+    
+    if nn > 1:
+        
+        for ii in range(nn-1):
+            
+            Cn = 2 * w * Cn_p - Cn_pp
+    
+            Cn_pp = Cn_p
+            Cn_p = Cn
+
+    elif nn == 1:
+        Cn = Cn_p
+        
+    else:
+        Cn = 1
+            
+    return(sp.simplify(sp.expand(Cn)))
+
+
+def trim_poly_s( this_poly, tol = 10**-6 ):
+
+    all_terms = this_poly.as_poly(s).all_terms()
+    
+    poly_acc = 0
+    
+    for this_pow, this_coeff in all_terms:
+    
+        if np.abs(this_coeff) > tol:
+            
+            poly_acc = poly_acc + this_coeff * s**this_pow[0]
+
+
+    return(poly_acc)
+
+def trim_func_s( rat_func, tol = 10**-6 ):
+
+    num, den = rat_func.as_numer_denom()
+    
+    num = trim_poly_s(num, tol)
+    den = trim_poly_s(den, tol)
+    
+    return(num/den)
+
 def modsq2mod_s( aa ):
 
     num, den = sp.fraction(aa)
-    
-    roots_num = sp.solve(num)
-    
-    real_part_roots = [ (s-roots_numm) for roots_numm in roots_num if sp.re(roots_numm) <= 0]
 
+    k = sp.poly(num,s).LC() / sp.poly(den,s).LC()
+    
+    # roots_num = num.as_poly(s).all_roots()
+    
+    # poly_acc = sp.Rational('1')
+    
+    roots_num = sp.roots(num)
+    
     poly_acc = sp.Rational('1')
-    
-    for roots_numm in real_part_roots:
-        poly_acc *= roots_numm
-    
+
+    for this_root in roots_num.keys():
+        
+        if sp.re(this_root) <= 0:
+            
+            # multiplicidad
+            mult = roots_num[this_root]
+
+            if mult > 1:
+                poly_acc *= (s-this_root)**sp.Rational(mult/2)
+            else:
+                poly_acc *= (s-this_root)
+
+    assert (len(num.as_poly(s).all_coeffs())-1)/2 == len(poly_acc.as_poly(s).all_coeffs())-1, 'Falló la factorización de modsq2mod_s. ¡Revisar!'
+
     num = sp.simplify(sp.expand(poly_acc))
 
-    roots_num = sp.solve(den)
-    
-    real_part_roots = [ (s-roots_numm) for roots_numm in roots_num if sp.re(roots_numm) <= 0]
 
+
+    # poly_acc = 0
+    
+    # for each_term in num.as_poly(s).all_terms():
+        
+    #     poly_acc += np.abs(each_term[1]) * s**each_term[0][0]
+
+    # num = poly_acc
+    
+    roots_num = sp.roots(den)
+    
     poly_acc = sp.Rational('1')
-    
-    for roots_numm in real_part_roots:
-        poly_acc *= roots_numm
-    
-    poly_acc = sp.simplify(sp.expand(poly_acc))
 
-    return(sp.simplify(sp.expand(num/poly_acc))) 
+    for this_root in roots_num.keys():
+        
+        if sp.re(this_root) <= 0:
+            
+            # multiplicidad
+            mult = roots_num[this_root]
+
+            if mult > 1:
+                poly_acc *= (s-this_root)**sp.Rational(mult/2)
+            else:
+                poly_acc *= (s-this_root)
+    
+    den = sp.simplify(sp.expand(poly_acc))
+
+    poly_acc = 0
+    
+    for each_term in den.as_poly(s).all_terms():
+        
+        poly_acc += np.abs(each_term[1]) * s**each_term[0][0]
+
+    den = poly_acc
+
+    return(sp.simplify(sp.expand(sp.sqrt(k) * num/den))) 
 
 
 def modsq2mod( aa ):
@@ -1576,9 +3423,7 @@ def pretty_print_SOS(mySOS, mode = 'default', displaystr = True):
 
 
 
-def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, annotations = True ):
-    
-    
+def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, annotations = True, digital = False, fs = 2*np.pi):
     
     valid_ext = ['none', 'png', 'svg']
     if img_ext not in valid_ext:
@@ -1606,7 +3451,7 @@ def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, ann
     axes_hdl = ()
 
     for ii in range(cant_sys):
-        fig_id, axes_hdl = bodePlot(all_sys[ii], fig_id, axes_hdl, filter_description = sys_name[ii])
+        fig_id, axes_hdl = bodePlot(all_sys[ii], fig_id, axes_hdl, filter_description = sys_name[ii], digital = digital, fs = fs)
 
     if img_ext != 'none':
         plt.savefig('_'.join(sys_name) + '_Bode.' + img_ext, format=img_ext)
@@ -1640,7 +3485,7 @@ def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, ann
             
             thisFilter = sos2tf_analog(all_sys[ii])
 
-            analog_fig_id, analog_axes_hdl = pzmap(thisFilter, filter_description=sys_name[ii], fig_id = analog_fig_id, axes_hdl=analog_axes_hdl, annotations = annotations)
+            analog_fig_id, analog_axes_hdl = pzmap(thisFilter, filter_description=sys_name[ii], fig_id = analog_fig_id, axes_hdl=analog_axes_hdl, annotations = annotations, digital = digital, fs = fs)
             
         else:
                 
@@ -1670,7 +3515,7 @@ def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, ann
         fig_id = 'none'
     
     for ii in range(cant_sys):
-        fig_id, axes_hdl = GroupDelay(all_sys[ii], fig_id, filter_description = sys_name[ii])
+        fig_id, axes_hdl = GroupDelay(all_sys[ii], fig_id, filter_description = sys_name[ii], digital = digital, fs = fs)
     
     # axes_hdl.legend(sys_name)
 
@@ -1681,7 +3526,7 @@ def analyze_sys( all_sys, sys_name = None, img_ext = 'none', same_figs=True, ann
 
 
 
-def pzmap(myFilter, annotations = False, filter_description='none', fig_id='none', axes_hdl='none'):
+def pzmap(myFilter, annotations = False, filter_description = None, fig_id='none', axes_hdl='none'):
     """Plot the complex s-plane given zeros and poles.
     Pamams:
      - b: array_like. Numerator polynomial coefficients.
@@ -1719,11 +3564,12 @@ def pzmap(myFilter, annotations = False, filter_description='none', fig_id='none
     
 #        maxRadius = np.abs(10*np.sqrt(p[0]))
     
-    # Plot the poles and set marker properties
-    poles = plt.plot(p.real, p.imag, 'x', markersize=9, label=filter_description)
     
-#    if filter_description != 'none':
-#        poles[0].label = filter_description
+    # Plot the poles and set marker properties
+    if filter_description is None:
+        poles = plt.plot(p.real, p.imag, 'x', markersize=9)
+    else:
+        poles = plt.plot(p.real, p.imag, 'x', markersize=9, label=filter_description)
     
     # Plot the zeros and set marker properties
     zeros = plt.plot(z.real, z.imag,  'o', markersize=9, 
@@ -1863,13 +3709,15 @@ def pzmap(myFilter, annotations = False, filter_description='none', fig_id='none
 
     fig_hdl.suptitle('Poles and Zeros map')
 
-    axes_hdl.legend()
+    if not(filter_description is None):
+       axes_hdl.legend()
 
     return fig_id, axes_hdl
     
 
-def GroupDelay(myFilter, fig_id='none', filter_description = '', npoints = 1000):
+def GroupDelay(myFilter, fig_id='none', filter_description=None, npoints = 1000, digital = False, fs = 2*np.pi):
 
+    w_nyq = 2*np.pi*fs/2
     
     if isinstance(myFilter, np.ndarray):
         # SOS section
@@ -1881,12 +3729,22 @@ def GroupDelay(myFilter, fig_id='none', filter_description = '', npoints = 1000)
             
             num, den = one_sos2tf(myFilter[ii,:])
             thisFilter = TransferFunction(num, den)
-            w, _, phase[:,ii] = thisFilter.bode(np.logspace(-2,2,npoints))
+            
+            if digital:
+                w, _, phase[:,ii] = thisFilter.bode(np.linspace(10**-2, w_nyq, npoints))
+            else:
+                w, _, phase[:,ii] = thisFilter.bode(np.logspace(-2,2,npoints))
+            
             sos_label += [filter_description + ' - SOS {:d}'.format(ii)]
         
         # whole filter
         thisFilter = sos2tf_analog(myFilter)
-        w, _, phase[:,cant_sos] = thisFilter.bode(np.logspace(-2,2,npoints))
+        
+        if digital:
+            w, _, phase[:,cant_sos] = thisFilter.bode(np.linspace(10**-2, w_nyq, npoints))
+        else:
+            w, _, phase[:,cant_sos] = thisFilter.bode(np.logspace(-2,2,npoints))
+        
         sos_label += [filter_description]
         
         filter_description = sos_label
@@ -1894,10 +3752,14 @@ def GroupDelay(myFilter, fig_id='none', filter_description = '', npoints = 1000)
     else:
         # LTI object
         cant_sos = 0
-        w,_,phase = myFilter.bode( np.logspace(-2,2,npoints) )
         
-        if isinstance(filter_description, str):
-            filter_description = [filter_description]
+        if myFilter.dt is None:
+            w, _, phase = myFilter.bode(np.logspace(-2,2,npoints))
+        else:
+            w, _, phase = myFilter.bode(np.linspace(10**-2, w_nyq, npoints))
+        
+        # if isinstance(filter_description, str):
+        #     filter_description = [filter_description]
 
 
     phaseRad = phase * np.pi / 180.0
@@ -1913,7 +3775,10 @@ def GroupDelay(myFilter, fig_id='none', filter_description = '', npoints = 1000)
             fig_hdl = plt.figure(fig_id)
             fig_id = fig_hdl.number
 
-    aux_hdl = plt.semilogx(w[1:], groupDelay, label=filter_description)    # Bode phase plot
+    if digital:
+        aux_hdl = plt.plot(w[1:] / w_nyq , groupDelay, label=filter_description)    # Bode phase plot
+    else:
+        aux_hdl = plt.semilogx(w[1:], groupDelay, label=filter_description)    # Bode phase plot
 
     if cant_sos > 0:
         # distinguish SOS from total response
@@ -1921,19 +3786,30 @@ def GroupDelay(myFilter, fig_id='none', filter_description = '', npoints = 1000)
         aux_hdl[-1].set_linewidth(2)
     
     plt.grid(True)
-    plt.xlabel('Angular frequency [rad/sec]')
+    
+    
+    if digital:
+
+        plt.gca().set_xlim([0, 1])
+        
+        plt.xlabel('Frecuencia normalizada a Nyq [#]')
+    else:
+        plt.xlabel('Angular frequency [rad/sec]')
+    
     plt.ylabel('Group Delay [sec]')
     plt.title('Group delay')
 
     axes_hdl = plt.gca()
     
-    if filter_description != '' :
+    if not(filter_description is None):
         # axes_hdl.legend( filter_description )
         axes_hdl.legend()
 
     return fig_id, axes_hdl
 
-def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', npoints = 1000 ):
+def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description=None, npoints = 1000, digital = False, fs = 2*np.pi ):
+
+    w_nyq = 2*np.pi*fs/2
     
     if isinstance(myFilter, np.ndarray):
         # SOS section
@@ -1946,12 +3822,21 @@ def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', 
             
             num, den = one_sos2tf(myFilter[ii,:])
             thisFilter = TransferFunction(num, den)
-            w, mag[:, ii], phase[:,ii] = thisFilter.bode(np.logspace(-2,2,npoints))
+            if digital:
+                w, mag[:, ii], phase[:,ii] = thisFilter.bode(np.linspace(10**-2, w_nyq,npoints))
+            else:
+                w, mag[:, ii], phase[:,ii] = thisFilter.bode(np.logspace(-2,2,npoints))
+                
             sos_label += [filter_description + ' - SOS {:d}'.format(ii)]
         
         # whole filter
         thisFilter = sos2tf_analog(myFilter)
-        w, mag[:, cant_sos], phase[:,cant_sos] = thisFilter.bode(np.logspace(-2,2,npoints))
+
+        if digital:
+            w, mag[:, cant_sos], phase[:,cant_sos] = thisFilter.bode(np.linspace(10**-2, w_nyq, npoints))
+        else:
+            w, mag[:, cant_sos], phase[:,cant_sos] = thisFilter.bode(np.logspace(-2,2,npoints))
+            
         sos_label += [filter_description]
         
         filter_description = sos_label
@@ -1959,10 +3844,15 @@ def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', 
     else:
         # LTI object
         cant_sos = 0
-        w, mag, phase = myFilter.bode(np.logspace(-2,2,npoints))
         
-        if isinstance(filter_description, str):
-            filter_description = [filter_description]
+        if myFilter.dt is None:
+            # filtro analógico normalizado
+            w, mag, phase = myFilter.bode(np.logspace(-2,2,npoints))
+        else:
+            w, mag, phase = myFilter.bode(np.linspace(10**-2, w_nyq, npoints))
+        
+        # if isinstance(filter_description, str):
+        #     filter_description = [filter_description]
         
 
     if fig_id == 'none':
@@ -1980,7 +3870,17 @@ def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', 
     (mag_ax_hdl, phase_ax_hdl) = axes_hdl
     
     plt.sca(mag_ax_hdl)
-    aux_hdl = plt.semilogx(w, mag, label=filter_description)    # Bode magnitude plot
+
+    if digital:
+        if filter_description is None:
+            aux_hdl = plt.plot(w / w_nyq, mag)    # Bode magnitude plot
+        else:
+            aux_hdl = plt.plot(w / w_nyq, mag, label=filter_description)    # Bode magnitude plot
+    else:
+        if filter_description is None:
+            aux_hdl = plt.semilogx(w, mag)    # Bode magnitude plot
+        else:
+            aux_hdl = plt.semilogx(w, mag, label=filter_description)    # Bode magnitude plot
     
     if cant_sos > 0:
         # distinguish SOS from total response
@@ -1992,17 +3892,30 @@ def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', 
     plt.ylabel('Magnitude [dB]')
     plt.title('Magnitude response')
     
-    if filter_description != '' :
+    if not(filter_description is None):
         # mag_ax_hdl.legend( filter_description )
         mag_ax_hdl.legend()
 
         
     plt.sca(phase_ax_hdl)
-    aux_hdl = plt.semilogx(w, np.pi/180*phase, label=filter_description)    # Bode phase plot
+    
+    if digital:
+        if filter_description is None:
+            aux_hdl = plt.plot(w / w_nyq, np.pi/180*phase)    # Bode phase plot
+        else:
+            aux_hdl = plt.plot(w / w_nyq, np.pi/180*phase, label=filter_description)    # Bode phase plot
+            
+    else:
+        if filter_description is None:
+            aux_hdl = plt.semilogx(w, np.pi/180*phase)    # Bode phase plot
+        else:
+            aux_hdl = plt.semilogx(w, np.pi/180*phase, label=filter_description)    # Bode phase plot
+    
     
     # Scale axes to fit
     ylim = plt.gca().get_ylim()
 
+    # presentar la fase como fracciones de \pi
     ticks = np.linspace(start=np.round(ylim[0]/np.pi)*np.pi, stop=np.round(ylim[1]/np.pi)*np.pi, num = 5, endpoint=True)
 
     ylabs = []
@@ -2040,16 +3953,97 @@ def bodePlot(myFilter, fig_id='none', axes_hdl='none', filter_description = '', 
         aux_hdl[-1].set_linewidth(2)
     
     plt.grid(True)
-    plt.xlabel('Angular frequency [rad/sec]')
+
+    if digital:
+
+        plt.gca().set_xlim([0, 1])
+        
+        plt.xlabel('Frecuencia normalizada a Nyq [#]')
+    else:
+        plt.xlabel('Angular frequency [rad/sec]')
     plt.ylabel('Phase [rad]')
     plt.title('Phase response')
     
-    if filter_description != '' :
+    if not(filter_description is None):
         # phase_ax_hdl.legend( filter_description )
         phase_ax_hdl.legend()
     
     return fig_id, axes_hdl
     
+
+def plot_plantilla(filter_type = 'lowpass', fpass = 0.25, ripple = 0.5, fstop = 0.6, attenuation = 40, fs = 2 ):
+    
+    # para sobreimprimir la plantilla de diseño de un filtro
+    
+    xmin, xmax, ymin, ymax = plt.axis()
+    
+    # banda de paso digital
+    plt.fill([xmin, xmin, fs/2, fs/2],   [ymin, ymax, ymax, ymin], 'g', alpha= 0.2, lw=1, label = 'bw digital') # pass
+    
+    if filter_type == 'lowpass':
+    
+        fstop_start = fstop
+        fstop_end = xmax
+        
+        fpass_start = xmin
+        fpass_end   = fpass
+    
+        plt.fill( [fstop_start, fstop_end,   fstop_end, fstop_start], [-attenuation, -attenuation, ymax, ymax], '0.9', lw=1, ls = '--', ec = 'k', label = 'plantilla') # stop
+        plt.fill( [fpass_start, fpass_start, fpass_end, fpass_end],   [ymin, -ripple, -ripple, ymin], '0.9', lw=1, ls = '--', ec = 'k') # pass
+    
+    elif filter_type == 'highpass':
+    
+        fstop_start = xmin
+        fstop_end = fstop 
+        
+        fpass_start = fpass
+        fpass_end   = xmax
+    
+        plt.fill( [fstop_start, fstop_end,   fstop_end, fstop_start], [-attenuation, -attenuation, ymax, ymax], '0.9', lw=1, ls = '--', ec = 'k', label = 'plantilla') # stop
+        plt.fill( [fpass_start, fpass_start, fpass_end, fpass_end],   [ymin, -ripple, -ripple, ymin], '0.9', lw=1, ls = '--', ec = 'k') # pass
+    
+    
+    elif filter_type == 'bandpass':
+    
+        fstop_start = xmin
+        fstop_end = fstop[0]
+        
+        fpass_start = fpass[0]
+        fpass_end   = fpass[1]
+        
+        fstop2_start = fstop[1]
+        fstop2_end =  xmax
+        
+        plt.fill( [fstop_start, fstop_end,   fstop_end, fstop_start], [-attenuation, -attenuation, ymax, ymax], '0.9', lw=1, ls = '--', ec = 'k', label = 'plantilla') # stop
+        plt.fill( [fpass_start, fpass_start, fpass_end, fpass_end],   [ymin, -ripple, -ripple, ymin], '0.9', lw=1, ls = '--', ec = 'k') # pass
+        plt.fill( [fstop2_start, fstop2_end,   fstop2_end, fstop2_start], [-attenuation, -attenuation, ymax, ymax], '0.9', lw=1, ls = '--', ec = 'k') # stop
+        
+    elif filter_type == 'bandstop':
+    
+        fpass_start = xmin
+        fpass_end   = fpass[0]
+    
+        fstop_start = fstop[0]
+        fstop_end = fstop[1]
+        
+        fpass2_start = fpass[1]
+        fpass2_end   = xmax
+            
+        plt.fill([fpass_start, fpass_start, fpass_end, fpass_end],   [ymin, -ripple, -ripple, ymin], '0.9', lw=1, ls = '--', ec = 'k', label = 'plantilla') # pass
+        plt.fill([fstop_start, fstop_end,   fstop_end, fstop_start], [-attenuation, -attenuation, ymax, ymax], '0.9', lw=1, ls = '--', ec = 'k') # stop
+        plt.fill([fpass2_start, fpass2_start, fpass2_end, fpass2_end],   [ymin, -ripple, -ripple, ymin], '0.9', lw=1, ls = '--', ec = 'k') # pass
+    
+    
+    plt.axis([xmin, xmax, np.max([ymin, -100]), np.max([ymax, 5])])
+    
+    axes_hdl = plt.gca()
+    axes_hdl.legend()
+    
+    plt.show()
+    
+    
+
+
 def sos2tf_analog(mySOS):
     
     SOSnumber, _ = mySOS.shape
@@ -2411,3 +4405,4 @@ def _cplxreal(z, tol=None):
     zc = (zp + zn.conj()) / 2
 
     return zc, zr
+
