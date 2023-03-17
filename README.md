@@ -1,2 +1,3 @@
-# tc2
-Scripts de ejemplo en Python para arrancar a simular funciones para la materia Teoría de Circuitos 2
+# Scripts de ejemplo para Teoria de Circuitos 2
+
+Este repositorio
