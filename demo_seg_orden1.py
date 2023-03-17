@@ -6,12 +6,14 @@ Created on Wed Mar 18 16:30:31 2020
 @author: mariano
 """
 
-
-from splane import pzmap, GroupDelay, bodePlot
+# Librerías externas NumPy, SciPy y Matplotlib
 from scipy.signal import TransferFunction
 import matplotlib.pyplot as plt
 import numpy as np
 
+
+# Librería de TC2, esta la vas a usar mucho
+from pytc2.sistemas_lineales import pzmap, GroupDelay, bodePlot
 
 w0 = 1
 qq = np.sqrt(2)/2
