@@ -1,8 +1,8 @@
 ![UTN_BA](logo_UTN.svg)
-# Material para comenzar a simular en Teoria de Circuitos 2
+# Materiales para comenzar a cursar Teoría de Circuitos 2
 
 Este repositorio te brindará los materiales necesarios para comenzar a 
-interactuar con los docentes y preparar tus herramientas:
+interactuar con los docentes y preparar tus herramientas de trabajo y simulación:
 
 * [Página principal de TC2](https://nbviewer.org/github/marianux/tc2/blob/main/principal.ipynb)
 
