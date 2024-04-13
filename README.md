@@ -7,7 +7,3 @@ interactuar con los docentes y preparar tus herramientas de trabajo y simulació
 * [Página principal de TC2](https://nbviewer.org/github/marianux/tc2/blob/main/principal.ipynb)
 
 * [Pereparar tu ambiente de trabajo](https://nbviewer.org/github/marianux/tc2/blob/main/preparacion.ipynb)
-
-
-
-
